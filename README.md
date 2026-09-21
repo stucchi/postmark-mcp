@@ -446,7 +446,7 @@ Suppress the email addresses spam@example.com and invalid@example.com on the out
 ```json
 {
   "messageStream": "outbound", // Optional, default: outbound
-  "emailAddresses": ["spam@example.com", "invalid@example.com"]
+  "emailAddresses": ["spam@example.com", "invalid@example.com"] // 1-50 addresses
 }
 ```
 
@@ -470,7 +470,7 @@ Unsuppress customer@example.com so we can send them emails again.
 ```json
 {
   "messageStream": "outbound", // Optional, default: outbound
-  "emailAddresses": ["customer@example.com"]
+  "emailAddresses": ["customer@example.com"] // 1-50 addresses
 }
 ```
 
@@ -498,11 +498,19 @@ All emails are automatically configured with:
 - `TrackLinks: "HtmlAndText"`
 - Message stream from `DEFAULT_MESSAGE_STREAM` environment variable
 
+### Postmark SDK
+All Postmark operations go through the official [`postmark`](https://www.npmjs.com/package/postmark) Node SDK (a single shared `ServerClient`), rather than hand-rolled HTTP requests. This centralizes the base URL, authentication, and error handling in one place.
+
+### Tool Annotations
+Tools carry MCP [tool annotations](https://modelcontextprotocol.io/docs/concepts/tools#tool-annotations) so hosts can reason about their behavior before calling them:
+- Read-only tools (`listTemplates`, `getDeliveryStats`, `getBounces`, `getBounce`, `getSuppressions`, `getBounceStats`, `getSpamStats`) are marked `readOnlyHint`.
+- Mutating tools (`sendEmail`, `sendEmailWithTemplate`, `activateBounce`, `createSuppressions`, `deleteSuppressions`) are not read-only; `deleteSuppressions` is additionally marked `destructiveHint` so a host can prompt for confirmation before removing suppressions.
+
 ### Error Handling
 The server implements comprehensive error handling:
 - Validation of all required environment variables
 - Graceful shutdown on SIGTERM and SIGINT
-- Proper error handling for API calls
+- API errors surface Postmark's own `ErrorCode`/`Message` (via the SDK) so the caller can see why a request failed
 - No exposure of sensitive information in logs
 - Consistent error message formatting
 

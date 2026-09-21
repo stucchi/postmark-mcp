@@ -2,20 +2,29 @@
  * @file Postmark MCP Server
  * @description Official Postmark MCP server for sending emails via Claude and AI assistants
  * @author Jabal Torres
- * @version 1.0.0
  * @license MIT
  */
 
 import 'dotenv/config';
-import fetch from 'node-fetch';
+import { readFileSync } from "fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import postmark from "postmark";
 
+// Single source of truth for the server version (also published in package.json / server.json)
+const { version: SERVER_VERSION } = JSON.parse(
+  readFileSync(new URL("./package.json", import.meta.url), "utf8")
+);
+
 const serverToken = process.env.POSTMARK_SERVER_TOKEN;
 const defaultSender = process.env.DEFAULT_SENDER_EMAIL;
 const defaultMessageStream = process.env.DEFAULT_MESSAGE_STREAM;
+
+// Drop undefined keys so the SDK only sends filters the caller actually provided.
+function buildFilter(obj) {
+  return Object.fromEntries(Object.entries(obj).filter(([, value]) => value !== undefined));
+}
 
 // Initialize Postmark client and MCP server
 async function initializeServices() {
@@ -46,7 +55,7 @@ async function initializeServices() {
 
     const mcpServer = new McpServer({
       name: "postmark-mcp",
-      version: "1.0.0"
+      version: SERVER_VERSION
     });
 
     return { postmarkClient: client, mcpServer };
@@ -119,6 +128,13 @@ function registerTools(server, postmarkClient) {
       from: z.string().email().optional().describe("Sender email address (optional, uses default if not provided)"),
       tag: z.string().optional().describe("Optional tag for categorization")
     },
+    {
+      title: "Send Email",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true
+    },
     async ({ to, subject, textBody, htmlBody, from, tag }) => {
       const emailData = {
         From: from || defaultSender,
@@ -156,6 +172,13 @@ function registerTools(server, postmarkClient) {
       templateModel: z.object({}).passthrough().describe("Data model for template variables"),
       from: z.string().email().optional().describe("Sender email address (optional)"),
       tag: z.string().optional().describe("Optional tag for categorization")
+    },
+    {
+      title: "Send Email With Template",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true
     },
     async ({ to, templateId, templateAlias, templateModel, from, tag }) => {
       if (!templateId && !templateAlias) {
@@ -196,6 +219,11 @@ function registerTools(server, postmarkClient) {
   server.tool(
     "listTemplates",
     {},
+    {
+      title: "List Templates",
+      readOnlyHint: true,
+      openWorldHint: true
+    },
     async () => {
       console.error('Fetching templates..');
       const result = await postmarkClient.getTemplates();
@@ -222,28 +250,15 @@ function registerTools(server, postmarkClient) {
       fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Start date in YYYY-MM-DD format (optional)"),
       toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("End date in YYYY-MM-DD format (optional)")
     },
+    {
+      title: "Get Delivery Stats",
+      readOnlyHint: true,
+      openWorldHint: true
+    },
     async ({ tag, fromDate, toDate }) => {
-      const query = [];
-      if (fromDate) query.push(`fromdate=${encodeURIComponent(fromDate)}`);
-      if (toDate) query.push(`todate=${encodeURIComponent(toDate)}`);
-      if (tag) query.push(`tag=${encodeURIComponent(tag)}`);
-
-      const url = `https://api.postmarkapp.com/stats/outbound${query.length ? '?' + query.join('&') : ''}`;
-
       console.error('Fetching delivery stats..');
 
-      const response = await fetch(url, {
-        headers: {
-          "Accept": "application/json",
-          "X-Postmark-Server-Token": serverToken
-        }
-      });
-
-      if (!response.ok) {
-        throw new Error(`API request failed: ${response.status} ${response.statusText}`);
-      }
-
-      const data = await response.json();
+      const data = await postmarkClient.getOutboundOverview(buildFilter({ tag, fromDate, toDate }));
       console.error('Stats retrieved successfully');
 
       const sent = data.Sent || 0;
@@ -283,36 +298,26 @@ function registerTools(server, postmarkClient) {
       toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("End date in YYYY-MM-DD format"),
       messageStream: z.string().optional().describe("Filter by message stream (default: all streams)")
     },
+    {
+      title: "Get Bounces",
+      readOnlyHint: true,
+      openWorldHint: true
+    },
     async ({ count, offset, type, inactive, emailFilter, tag, messageID, fromDate, toDate, messageStream }) => {
-      const query = [];
-      if (count) query.push(`count=${count}`);
-      else query.push('count=25');
-      if (offset) query.push(`offset=${offset}`);
-      else query.push('offset=0');
-      if (type) query.push(`type=${encodeURIComponent(type)}`);
-      if (inactive !== undefined) query.push(`inactive=${inactive}`);
-      if (emailFilter) query.push(`emailFilter=${encodeURIComponent(emailFilter)}`);
-      if (tag) query.push(`tag=${encodeURIComponent(tag)}`);
-      if (messageID) query.push(`messageID=${encodeURIComponent(messageID)}`);
-      if (fromDate) query.push(`fromdate=${encodeURIComponent(fromDate)}`);
-      if (toDate) query.push(`todate=${encodeURIComponent(toDate)}`);
-      if (messageStream) query.push(`messagestream=${encodeURIComponent(messageStream)}`);
-
-      const url = `https://api.postmarkapp.com/bounces?${query.join('&')}`;
       console.error('Fetching bounces..');
 
-      const response = await fetch(url, {
-        headers: {
-          "Accept": "application/json",
-          "X-Postmark-Server-Token": serverToken
-        }
-      });
-
-      if (!response.ok) {
-        throw new Error(`API request failed: ${response.status} ${response.statusText}`);
-      }
-
-      const data = await response.json();
+      const data = await postmarkClient.getBounces(buildFilter({
+        count: count ?? 25,
+        offset: offset ?? 0,
+        type,
+        inactive,
+        emailFilter,
+        tag,
+        messageID,
+        fromDate,
+        toDate,
+        messageStream
+      }));
       console.error(`Found ${data.TotalCount} bounces`);
 
       const bounceList = data.Bounces.map(b =>
@@ -334,21 +339,15 @@ function registerTools(server, postmarkClient) {
     {
       bounceId: z.number().describe("The bounce ID to retrieve")
     },
+    {
+      title: "Get Bounce",
+      readOnlyHint: true,
+      openWorldHint: true
+    },
     async ({ bounceId }) => {
       console.error('Fetching bounce details..', { bounceId });
 
-      const response = await fetch(`https://api.postmarkapp.com/bounces/${bounceId}`, {
-        headers: {
-          "Accept": "application/json",
-          "X-Postmark-Server-Token": serverToken
-        }
-      });
-
-      if (!response.ok) {
-        throw new Error(`API request failed: ${response.status} ${response.statusText}`);
-      }
-
-      const b = await response.json();
+      const b = await postmarkClient.getBounce(bounceId);
       console.error('Bounce details retrieved');
 
       return {
@@ -377,23 +376,17 @@ function registerTools(server, postmarkClient) {
     {
       bounceId: z.number().describe("The bounce ID to activate/unblock")
     },
+    {
+      title: "Activate Bounce",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true
+    },
     async ({ bounceId }) => {
       console.error('Activating bounce..', { bounceId });
 
-      const response = await fetch(`https://api.postmarkapp.com/bounces/${bounceId}/activate`, {
-        method: 'PUT',
-        headers: {
-          "Accept": "application/json",
-          "Content-Type": "application/json",
-          "X-Postmark-Server-Token": serverToken
-        }
-      });
-
-      if (!response.ok) {
-        throw new Error(`API request failed: ${response.status} ${response.statusText}`);
-      }
-
-      const data = await response.json();
+      const data = await postmarkClient.activateBounce(bounceId);
       console.error('Bounce activated successfully');
 
       return {
@@ -418,28 +411,16 @@ function registerTools(server, postmarkClient) {
       origin: z.string().optional().describe("Filter by origin: Recipient, Customer, Admin"),
       emailAddress: z.string().optional().describe("Filter by email address")
     },
+    {
+      title: "Get Suppressions",
+      readOnlyHint: true,
+      openWorldHint: true
+    },
     async ({ messageStream, suppressionReason, origin, emailAddress }) => {
       const stream = messageStream || 'outbound';
-      const query = [];
-      if (suppressionReason) query.push(`SuppressionReason=${encodeURIComponent(suppressionReason)}`);
-      if (origin) query.push(`Origin=${encodeURIComponent(origin)}`);
-      if (emailAddress) query.push(`EmailAddress=${encodeURIComponent(emailAddress)}`);
-
-      const url = `https://api.postmarkapp.com/message-streams/${stream}/suppressions/dump${query.length ? '?' + query.join('&') : ''}`;
       console.error('Fetching suppressions..', { stream });
 
-      const response = await fetch(url, {
-        headers: {
-          "Accept": "application/json",
-          "X-Postmark-Server-Token": serverToken
-        }
-      });
-
-      if (!response.ok) {
-        throw new Error(`API request failed: ${response.status} ${response.statusText}`);
-      }
-
-      const data = await response.json();
+      const data = await postmarkClient.getSuppressions(stream, buildFilter({ suppressionReason, origin, emailAddress }));
       const suppressions = data.Suppressions || [];
       console.error(`Found ${suppressions.length} suppressions`);
 
@@ -461,31 +442,22 @@ function registerTools(server, postmarkClient) {
     "createSuppressions",
     {
       messageStream: z.string().optional().describe("Message stream ID (default: outbound)"),
-      emailAddresses: z.array(z.string().email()).describe("List of email addresses to suppress")
+      emailAddresses: z.array(z.string().email()).min(1).max(50).describe("List of email addresses to suppress (1-50)")
+    },
+    {
+      title: "Create Suppressions",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true
     },
     async ({ messageStream, emailAddresses }) => {
       const stream = messageStream || 'outbound';
-      const body = {
-        Suppressions: emailAddresses.map(e => ({ EmailAddress: e }))
-      };
-
       console.error('Creating suppressions..', { stream, count: emailAddresses.length });
 
-      const response = await fetch(`https://api.postmarkapp.com/message-streams/${stream}/suppressions`, {
-        method: 'POST',
-        headers: {
-          "Accept": "application/json",
-          "Content-Type": "application/json",
-          "X-Postmark-Server-Token": serverToken
-        },
-        body: JSON.stringify(body)
+      const data = await postmarkClient.createSuppressions(stream, {
+        Suppressions: emailAddresses.map(e => ({ EmailAddress: e }))
       });
-
-      if (!response.ok) {
-        throw new Error(`API request failed: ${response.status} ${response.statusText}`);
-      }
-
-      const data = await response.json();
       const results = data.Suppressions || [];
       console.error('Suppressions created');
 
@@ -507,31 +479,22 @@ function registerTools(server, postmarkClient) {
     "deleteSuppressions",
     {
       messageStream: z.string().optional().describe("Message stream ID (default: outbound)"),
-      emailAddresses: z.array(z.string().email()).describe("List of email addresses to unsuppress/unblock")
+      emailAddresses: z.array(z.string().email()).min(1).max(50).describe("List of email addresses to unsuppress/unblock (1-50)")
+    },
+    {
+      title: "Delete Suppressions",
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: true
     },
     async ({ messageStream, emailAddresses }) => {
       const stream = messageStream || 'outbound';
-      const body = {
-        Suppressions: emailAddresses.map(e => ({ EmailAddress: e }))
-      };
-
       console.error('Deleting suppressions..', { stream, count: emailAddresses.length });
 
-      const response = await fetch(`https://api.postmarkapp.com/message-streams/${stream}/suppressions/delete`, {
-        method: 'POST',
-        headers: {
-          "Accept": "application/json",
-          "Content-Type": "application/json",
-          "X-Postmark-Server-Token": serverToken
-        },
-        body: JSON.stringify(body)
+      const data = await postmarkClient.deleteSuppressions(stream, {
+        Suppressions: emailAddresses.map(e => ({ EmailAddress: e }))
       });
-
-      if (!response.ok) {
-        throw new Error(`API request failed: ${response.status} ${response.statusText}`);
-      }
-
-      const data = await response.json();
       const results = data.Suppressions || [];
       console.error('Suppressions deleted');
 
@@ -556,27 +519,15 @@ function registerTools(server, postmarkClient) {
       fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Start date in YYYY-MM-DD format"),
       toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("End date in YYYY-MM-DD format")
     },
+    {
+      title: "Get Bounce Stats",
+      readOnlyHint: true,
+      openWorldHint: true
+    },
     async ({ tag, fromDate, toDate }) => {
-      const query = [];
-      if (fromDate) query.push(`fromdate=${encodeURIComponent(fromDate)}`);
-      if (toDate) query.push(`todate=${encodeURIComponent(toDate)}`);
-      if (tag) query.push(`tag=${encodeURIComponent(tag)}`);
-
-      const url = `https://api.postmarkapp.com/stats/outbound/bounces${query.length ? '?' + query.join('&') : ''}`;
       console.error('Fetching bounce stats..');
 
-      const response = await fetch(url, {
-        headers: {
-          "Accept": "application/json",
-          "X-Postmark-Server-Token": serverToken
-        }
-      });
-
-      if (!response.ok) {
-        throw new Error(`API request failed: ${response.status} ${response.statusText}`);
-      }
-
-      const data = await response.json();
+      const data = await postmarkClient.getBounceCounts(buildFilter({ tag, fromDate, toDate }));
       console.error('Bounce stats retrieved');
 
       const days = (data.Days || []).map(d =>
@@ -603,27 +554,15 @@ function registerTools(server, postmarkClient) {
       fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Start date in YYYY-MM-DD format"),
       toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("End date in YYYY-MM-DD format")
     },
+    {
+      title: "Get Spam Stats",
+      readOnlyHint: true,
+      openWorldHint: true
+    },
     async ({ tag, fromDate, toDate }) => {
-      const query = [];
-      if (fromDate) query.push(`fromdate=${encodeURIComponent(fromDate)}`);
-      if (toDate) query.push(`todate=${encodeURIComponent(toDate)}`);
-      if (tag) query.push(`tag=${encodeURIComponent(tag)}`);
-
-      const url = `https://api.postmarkapp.com/stats/outbound/spam${query.length ? '?' + query.join('&') : ''}`;
       console.error('Fetching spam complaint stats..');
 
-      const response = await fetch(url, {
-        headers: {
-          "Accept": "application/json",
-          "X-Postmark-Server-Token": serverToken
-        }
-      });
-
-      if (!response.ok) {
-        throw new Error(`API request failed: ${response.status} ${response.statusText}`);
-      }
-
-      const data = await response.json();
+      const data = await postmarkClient.getSpamComplaintsCounts(buildFilter({ tag, fromDate, toDate }));
       console.error('Spam stats retrieved');
 
       const days = (data.Days || []).map(d =>
